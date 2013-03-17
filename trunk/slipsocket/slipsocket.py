@@ -1,18 +1,35 @@
-'''
+﻿'''
 Created on 11 mrt. 2013
 
-@author: Ruud
+@author: Ruud de Jong
 '''
 
 import socket as s
 
-_END = b'\xc0'
-_ESC = b'\xdb'
-_ESC_END = b'\xdb\xdc'
-_ESC_ESC = b'\xdb\xdd'
+_END = b'\xc0'                # SLIP <END> symbol
+_ESC = b'\xdb'                # SLIP <ESC> symbol
+_ESC_END = b'\xdb\xdc'        # SLIP <ESC_END> symbol
+_ESC_ESC = b'\xdb\xdd'        # SLIP <ESC_ESC> symbol
 _BUF_SIZE = 4096
 
+ 
+def encode(data):
+    '''encode(data) -> bytes object with SLIP encoded data
+    
+    <END> bytes are replaced with <ESC_END>,
+    <ESC> bytes are replaced with <ESC_ESC>,
+    the resulting bytes are delimited with <END> bytes.'''
+    return _END + data.replace(_ESC, _ESC_ESC).replace(_END, _ESC_END) + _END
+    
+def decode(packet):
+    '''decode(packet) -> bytes object without SLIP delimiters and special slip escape sequences
+    
+    Packet must be in format <END> <escaped-data> <END>
+    Missing leading or trailing <END> symbols are allowed,
+    as are multiple occurances of the <END> symbol.'''
+    return packet.strip(_END).replace(_ESC_END, _END).replace(_ESC_ESC, _ESC)
 
+    
 class socket(s.socket):
     def __init__(self, family=s.AF_INET, type=s.SOCK_STREAM, proto=0, fileno=None):
         if type != s.SOCK_STREAM:
@@ -20,17 +37,6 @@ class socket(s.socket):
         super().__init__(family, type, proto, fileno)
         self._buffer = bytearray()
         self._source = None
-    
-    @staticmethod    
-    def _encode(data):
-        return _END + data.replace(_ESC, _ESC_ESC).replace(_END, _ESC_END) + _END
-    
-    @staticmethod
-    def _decode(packet):
-        # Packet must be in format <END> <escaped-data> <END>
-        # Missing leading or trailing <END> symbols are allowed,
-        # as are multiple occurances of the <END> symbol. 
-        return packet.strip(_END).replace(_ESC_END, _END).replace(_ESC_ESC, _ESC)
     
     def _refresh(self, flags):
         new_data, addr = super().recvfrom(_BUF_SIZE, flags)
@@ -44,7 +50,7 @@ class socket(s.socket):
         return self.__class__(conn.family, conn.type, conn.proto, conn.detach()), addr
 
     def sendall(self, data):
-        super().sendall(self._encode(data))
+        super().sendall(encode(data))
     
     send = sendall
     
@@ -61,17 +67,15 @@ class socket(s.socket):
         while _END not in self._buffer:
             self._refresh(flags)
         
-        # Locate the (first) trailing <END> symbol
+        # Locate the (first) trailing <END> symbol and extract the packet
         end_index = self._buffer.find(_END)
-        
-        # Extract the packet
         packet = self._buffer[:end_index]
         
         # Remove the packet from the buffer, including the trailing <END> symbol
         del self._buffer[:end_index+1]
         
         # Return the decoded data and source
-        return self._decode(packet)
+        return decode(packet)
 
     def recv(self, flags=0):
         return self._recv(flags=flags)
@@ -102,7 +106,7 @@ if hasattr(s, 'socketpair'):
         a = socket(family, type, proto, a.detach())
         b = socket(family, type, proto, b.detach())
         return a, b
-        pass
+
 
 def fromfd(fd, family, type, proto=0):
     nfd = s.dup(fd)
