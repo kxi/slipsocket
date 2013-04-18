@@ -38,7 +38,7 @@ choices:
  This module offers:
  
  - Basic SLIP encode and decode functions.
- - SlipReader, SlipWriter, SlipRandom, and SlipRWPair classes that wrap the corresponding 
+ - SLIPReader, SLIPWriter, SLIPRandom, and SLIPRWPair classes that wrap the corresponding 
    classesBufferedReader, BufferedWriter, BufferedRandom, and BufferedRWPair from the 
    io module with the SLIP protocol. Reads from these classes deliver decoded SLIP packets, 
    writes will push encoded SLIP packets to the underlying stream.
@@ -233,8 +233,11 @@ class _slipreaderfuncs(_slipfuncs):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Create the internal buffer that will use the read1 method of the underlying BufferedIO object
-        self._buffer = _Buffer(self._io.read1, io.DEFAULT_BUFFER_SIZE)
+        if hasattr(self._io, '_buffer'):
+            self._buffer = self._io.buffer
+        else:
+            # Create the internal buffer that will use the read1 method of the underlying BufferedIO object
+            self._buffer = _Buffer(self._io.read1, io.DEFAULT_BUFFER_SIZE)
         
     def read(self):
         '''read() --> the next decoded SLIP packet'''
@@ -277,14 +280,14 @@ class _slipreaderfuncs(_slipfuncs):
             raise StopIteration
 
     def readinto(self, buf):
-        '''SlipReader.readinto is not implemented.
+        '''SLIPReader.readinto is not implemented.
         
         Using readinto to fill a buffer with possibly a partial or multiple SLIP packets
         is meaningless, because the separation between SLIP packets would be lost.'''
         raise io.UnsupportedOperation('readinto')
     
     def peek(self, count):
-        '''SlipReader.peek is not implemented.
+        '''SLIPReader.peek is not implemented.
         
         Partial decoding and maintaining the proper position in the buffer was considered
         too much effort. It is simpler to just read the next packet, and provide your own
@@ -317,19 +320,19 @@ class _slipwriterfuncs(_slipfuncs):
         return self._io.truncate(size)
         
 
-class SlipReader(_slipreaderfuncs):
+class SLIPReader(_slipreaderfuncs):
     _io = io.BufferedReader
     
 
-class SlipWriter(_slipwriterfuncs):
+class SLIPWriter(_slipwriterfuncs):
     _io = io.BufferedWriter
 
 
-class SlipRandom(_slipreaderfuncs, _slipwriterfuncs):
+class SLIPRandom(_slipreaderfuncs, _slipwriterfuncs):
     _io = io.BufferedRandom
 
 
-class SlipRWPair(_slipreaderfuncs, _slipwriterfuncs):
+class SLIPRWPair(_slipreaderfuncs, _slipwriterfuncs):
     _io = io.BufferedRWPair
     
 
@@ -338,20 +341,21 @@ def wrap(obj):
     
     obj must be a BufferedIOBase object'''
     if not obj.readable():
-        return SlipWriter(obj)  # Only SlipWriter is not readable
+        return SLIPWriter(obj)  # Only SLIPWriter is not readable
     if not obj.writable():
-        return SlipReader(obj)  # Only SlipReader is not writable
+        return SLIPReader(obj)  # Only SLIPReader is not writable
     if not obj.seekable():
-        return SlipRWPair(obj)  # Only SlipRWPair is readable, writable, but not seekable
-    return SlipRandom(obj)      # SlipRandom is readable, writable, and seekable
+        return SLIPRWPair(obj)  # Only SLIPRWPair is readable, writable, but not seekable
+    return SLIPRandom(obj)      # SLIPRandom is readable, writable, and seekable
 
 
-class SlipSocket(socket.socket):
+class SLIPSocket(socket.socket):
     def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, fileno=None):
         if type != socket.SOCK_STREAM:
             raise ValueError('slipsocket.SlipSocket requires type=SOCK_STREAM')
         super().__init__(family, type, proto, fileno)
         self._buffer = _Buffer(super().recv, io.DEFAULT_BUFFER_SIZE)
+        self._raw_recv = super().recv
     
     def accept(self):
         conn, addr = super().accept()
@@ -359,9 +363,13 @@ class SlipSocket(socket.socket):
         return self.__class__(conn.family, conn.type, conn.proto, conn.detach()), addr
 
     def makefile(self, mode='r'):
+        raw_recv = super().recv
+        
         if 'b' not in mode:
             mode += 'b'
-        return wrap(super().makefile(mode))
+        raw = super().makefile(mode, buffering=0)
+        raw.read1 = raw_recv
+        return wrap(raw)
     
     def sendall(self, data):
         super().sendall(encode(data))
@@ -396,13 +404,31 @@ class SlipSocket(socket.socket):
         return self._buffer.get(flags)
     
     def recvfrom(self, flags=0):
-        raise AttributeError('slipsocket.socket does not support recvfrom')
+        peername = self.getpeername()
+        return self._buffer.get(flags), peername
 
-    def recvfrom_into(self, *args, **kwargs):
-        raise AttributeError('slipsocket.socket does not support recvfrom_into')
+    def recvfrom_into(self, buf, size=None, flags=0):
+        peername = self.getpeername()
+        if size is None:
+            size = len(buf)
+        m = self._buffer.get(flags)
+        bytes_read = len(m)
+        if bytes_read > size:
+            buf[:] = m[:size]
+        else:
+            buf[:bytes_read] = m
+        return min(bytes_read, size), peername
     
-    def recv_into(self, *args, **kwargs):
-        raise AttributeError('slipsocket.socket does not support recv_into')
+    def recv_into(self, buf, size=None, flags=0):
+        if size is None:
+            size = len(buf)
+        m = self._buffer.get(flags)
+        bytes_read = len(m)
+        if bytes_read > size:
+            buf[:] = m[:size]
+        else:
+            buf[:bytes_read] = m
+        return min(bytes_read, size)
     
     def recvmsg(self, *args, **kwargs):
         raise AttributeError('slipsocket.socket does not support recvmsg')
@@ -416,18 +442,18 @@ class SlipSocket(socket.socket):
 
         
 if hasattr(socket, 'socketpair'):
-    def slipSocketPair(family=None, type=socket.SOCK_STREAM, proto=socket.IPPROTO_IP):
+    def slip_socketpair(family=None, type=socket.SOCK_STREAM, proto=socket.IPPROTO_IP):
         a, b = socket.socketpair(family, type, proto)
-        a = SlipSocket(family, type, proto, a.detach())
-        b = SlipSocket(family, type, proto, b.detach())
+        a = SLIPSocket(family, type, proto, a.detach())
+        b = SLIPSocket(family, type, proto, b.detach())
         return a, b
 
 
-def slipFromFd(fd, family, type, proto=0):
+def slip_fromfd(fd, family, type, proto=0):
     nfd = socket.dup(fd)
-    return SlipSocket(family, type, proto, nfd)
+    return SLIPSocket(family, type, proto, nfd)
 
-def createSlipConnection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+def create_slip_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
     """Connect to *address* and return the SlipSocket object.
 
     Convenience function.  Connect to *address* (a 2-tuple ``(host,
@@ -440,6 +466,6 @@ def createSlipConnection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source
     An host of '' or port 0 tells the OS to use the default.
     """
     sock = socket.create_connection(address, timeout, source_address)
-    return SlipSocket(sock.family, sock.type, sock.proto, sock.detach())
+    return SLIPSocket(sock.family, sock.type, sock.proto, sock.detach())
 
 
